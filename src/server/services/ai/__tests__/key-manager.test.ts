@@ -10,10 +10,12 @@ import {
   KeyManager,
   AllGeminiKeysFailedError,
   classifyGeminiError,
+  probeGeminiModels,
   resolveCandidateKeys,
   verifyGeminiKey,
   PER_MINUTE_COOLDOWN_MS,
   DAILY_QUOTA_COOLDOWN_MS,
+  TOTAL_REQUEST_BUDGET_MS,
 } from "../key-manager";
 
 describe("crypto (AES-256-GCM, masking, fingerprinting)", () => {
@@ -119,7 +121,7 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
       "transient"
     );
     expect(classifyGeminiError({ status: 404, message: "MODEL_NOT_FOUND" })).toMatchObject({
-      category: "transient",
+      category: "model_unavailable",
       modelFallbackReason: "model_not_found",
     });
   });
@@ -128,7 +130,7 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
     let nowMs = 1_000_000;
     const km = new KeyManager({
       now: () => nowMs,
-      sleep: async () => {},
+      sleep: async () => { },
       random: () => 0.5,
     });
 
@@ -210,7 +212,7 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
   it("marks 400/403 keys invalid and reports invalidTeacherFingerprints", async () => {
     const km = new KeyManager({
       now: () => 1_000_000,
-      sleep: async () => {},
+      sleep: async () => { },
     });
 
     const badTeacher = "AIzaBadTeacherKey9999";
@@ -245,11 +247,11 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
     expect(runSpy).not.toHaveBeenCalled();
   });
 
-  it("enforces max 4 attempts limit across keys and retries", async () => {
+  it("enforces max 6 attempts limit across keys and retries", async () => {
     const km = new KeyManager({
       now: () => 1_000_000,
-      sleep: async () => {},
-      random: () => 0,
+      sleep: async () => { },
+      random: () => 0.5,
     });
 
     const keys = [
@@ -276,25 +278,35 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
       caught = err;
     }
 
-    expect(callCount).toBe(4);
+    expect(callCount).toBe(6);
     expect(caught).toBeInstanceOf(AllGeminiKeysFailedError);
-    expect((caught as AllGeminiKeysFailedError).attempts).toHaveLength(4);
+    expect((caught as AllGeminiKeysFailedError).attempts).toHaveLength(6);
   });
 
-  it("retries transient 5xx once per key and falls back model only on model_not_found/overloaded", async () => {
+  it("classifies 404 NOT_FOUND as model_unavailable without retry or key cooldown", async () => {
+    const classified = classifyGeminiError(
+      Object.assign(
+        new Error("This model models/gemini-2.5-flash is no longer available"),
+        { status: 404 }
+      )
+    );
+    expect(classified.category).toBe("model_unavailable");
+    expect(classified.modelFallbackReason).toBe("model_not_found");
+
     const km = new KeyManager({
       now: () => 1_000_000,
-      sleep: async () => {},
-      random: () => 0,
+      sleep: async () => { },
+      random: () => 0.5,
     });
 
+    const sysKey = "AIzaSysKey1234";
     const seenModels: string[] = [];
     const res = await km.execute({
-      systemKeysOverride: ["AIzaSysKey1234"],
+      systemKeysOverride: [sysKey],
       primaryModel: "gemini-2.5-flash",
-      run: async ({ model, attempt }) => {
+      run: async ({ model }) => {
         seenModels.push(model);
-        if (attempt === 1) {
+        if (model === "gemini-2.5-flash") {
           throw Object.assign(new Error("Model not found"), { status: 404 });
         }
         return "recovered";
@@ -303,13 +315,19 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
 
     expect(res.value).toBe("recovered");
     expect(seenModels).toEqual(["gemini-2.5-flash", "gemini-3.5-flash-lite"]);
+    expect(km.getKeyStatus(res.fingerprint).status).toBe("active");
   });
 
-  it("retries overloaded 503 once on primary model before falling back to gemini-3.5-flash-lite", async () => {
+  it("retries 503 overloaded with exponential backoff (1.5s -> 4s -> 9s) before falling back", async () => {
+    let nowMs = 1_000_000;
+    const sleeps: number[] = [];
     const km = new KeyManager({
-      now: () => 1_000_000,
-      sleep: async () => {},
-      random: () => 0,
+      now: () => nowMs,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        nowMs += ms;
+      },
+      random: () => 0.5, // exact base delays: 1500, 4000, 9000
     });
 
     const seenModels: string[] = [];
@@ -318,21 +336,114 @@ describe("key-manager (ordering, cooldown, classification, limits)", () => {
       primaryModel: "gemini-3.8-flash",
       run: async ({ model, attempt }) => {
         seenModels.push(model);
-        if (attempt <= 2) {
-          throw Object.assign(new Error("This model is currently experiencing high demand"), {
-            status: 503,
-          });
+        if (attempt <= 4) {
+          throw Object.assign(
+            new Error("This model is currently experiencing high demand"),
+            { status: 503 }
+          );
         }
-        return "recovered-after-503";
+        return "recovered-after-backoff";
       },
     });
 
-    expect(res.value).toBe("recovered-after-503");
+    expect(res.value).toBe("recovered-after-backoff");
     expect(seenModels).toEqual([
+      "gemini-3.8-flash",
+      "gemini-3.8-flash",
       "gemini-3.8-flash",
       "gemini-3.8-flash",
       "gemini-3.5-flash-lite",
     ]);
+    expect(sleeps).toEqual([1500, 4000, 9000]);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(
+      TOTAL_REQUEST_BUDGET_MS
+    );
+  });
+
+  it("never exceeds TOTAL_REQUEST_BUDGET_MS during backoff and skips backoff on 429", async () => {
+    let nowMs = 1_000_000;
+    const sleeps: number[] = [];
+    const km = new KeyManager({
+      now: () => nowMs,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        nowMs += ms;
+      },
+      random: () => 0.5,
+    });
+
+    await expect(
+      km.execute({
+        systemKeysOverride: ["AIzaSysKey1234"],
+        primaryModel: "gemini-3.8-flash",
+        totalBudgetMs: 3_000,
+        run: async () => {
+          throw Object.assign(new Error("Service unavailable"), { status: 503 });
+        },
+      })
+    ).rejects.toBeInstanceOf(AllGeminiKeysFailedError);
+
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(3_000);
+
+    // 429 triggers immediate cooldown without backoff sleep
+    const sleeps429: number[] = [];
+    const km429 = new KeyManager({
+      now: () => 1_000_000,
+      sleep: async (ms) => {
+        sleeps429.push(ms);
+      },
+      random: () => 0.5,
+    });
+    await expect(
+      km429.execute({
+        systemKeysOverride: ["AIzaSysKeyQuota"],
+        primaryModel: "gemini-3.8-flash",
+        run: async () => {
+          throw Object.assign(new Error("Too many requests"), { status: 429 });
+        },
+      })
+    ).rejects.toBeInstanceOf(AllGeminiKeysFailedError);
+    expect(sleeps429).toEqual([]);
+  });
+
+  it("probes all models in chain and classifies 404 as model_unavailable", async () => {
+    const okResults = await probeGeminiModels({
+      systemKeysOverride: ["AIzaProbeKey1111"],
+      primaryModel: "gemini-3.8-flash",
+      clientFactory: () => ({
+        models: {
+          generateContent: async () => ({ text: "ok" }),
+        },
+      }),
+    });
+    expect(okResults.map((r) => ({ model: r.model, ok: r.ok }))).toEqual([
+      { model: "gemini-3.8-flash", ok: true },
+      { model: "gemini-3.5-flash-lite", ok: true },
+    ]);
+
+    const mixedResults = await probeGeminiModels({
+      systemKeysOverride: ["AIzaProbeKey1111"],
+      primaryModel: "gemini-missing-model",
+      clientFactory: () => ({
+        models: {
+          generateContent: async ({ model }) => {
+            if (model === "gemini-missing-model") {
+              throw Object.assign(new Error("Model not found"), { status: 404 });
+            }
+            return { text: "ok" };
+          },
+        },
+      }),
+    });
+    expect(mixedResults[0]).toMatchObject({
+      model: "gemini-missing-model",
+      ok: false,
+      category: "model_unavailable",
+    });
+    expect(mixedResults[1]).toMatchObject({
+      model: "gemini-3.5-flash-lite",
+      ok: true,
+    });
   });
 
   it("verifies a single key via fake client without exposing raw key", async () => {

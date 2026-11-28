@@ -51,6 +51,18 @@ export function TeacherSettingsClient({ teacher }: TeacherSettingsProps) {
     message: string;
   } | null>(null);
 
+  // AI model connection probe state
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [connectionResults, setConnectionResults] = useState<
+    Array<{
+      model: string;
+      ok: boolean;
+      category?: string;
+      latencyMs: number;
+    }> | null
+  >(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
   // Load masked keys from server if only legacy prop or empty was provided
   useEffect(() => {
     if (teacher?.maskedGeminiKeys) return;
@@ -68,6 +80,35 @@ export function TeacherSettingsClient({ teacher }: TeacherSettingsProps) {
       active = false;
     };
   }, [teacher?.maskedGeminiKeys]);
+
+  async function handleTestAiConnection() {
+    setIsTestingConnection(true);
+    setConnectionError(null);
+    try {
+      const res = await fetch("/api/ai/test-connection", { method: "POST" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as { error?: string } | null;
+        setConnectionError(data?.error ?? "Gagal menguji koneksi AI.");
+        setConnectionResults(null);
+        return;
+      }
+      const data = (await res.json()) as {
+        ok: boolean;
+        results: Array<{
+          model: string;
+          ok: boolean;
+          category?: string;
+          latencyMs: number;
+        }>;
+      };
+      setConnectionResults(data.results ?? []);
+    } catch {
+      setConnectionError("Tidak dapat menghubungi endpoint Tes Koneksi AI.");
+      setConnectionResults(null);
+    } finally {
+      setIsTestingConnection(false);
+    }
+  }
 
   async function persistKeyList(items: TeacherKeyInputItem[], successMessage?: string) {
     setIsSavingKeys(true);
@@ -448,17 +489,77 @@ export function TeacherSettingsClient({ teacher }: TeacherSettingsProps) {
           {/* 4. API Key Gemini (Terenkripsi) & Pemeriksaan Layanan */}
           <Card as="section" className="flex flex-1 flex-col justify-between gap-5">
             <div className="flex flex-col gap-4">
-              <div className="flex items-start gap-3.5">
-                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-subtle)] text-[var(--primary)]">
-                  <Icon name="Sparkle" size={22} />
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-subtle)] text-[var(--primary)]">
+                    <Icon name="Sparkle" size={22} />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold text-[var(--ink)]">API Key Gemini &amp; Layanan AI</h2>
+                    <p className="text-sm text-[var(--ink-2)] mt-1 leading-relaxed">
+                      Tambahkan hingga {MAX_KEYS} API Key Google Gemini sebagai cadangan setelah kunci server. Semua kunci disimpan terenkripsi.
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <h2 className="text-xl font-bold text-[var(--ink)]">API Key Gemini &amp; Layanan AI</h2>
-                  <p className="text-sm text-[var(--ink-2)] mt-1 leading-relaxed">
-                    Tambahkan hingga {MAX_KEYS} API Key Google Gemini sebagai cadangan setelah kunci server. Semua kunci disimpan terenkripsi.
-                  </p>
-                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="compact"
+                  loading={isTestingConnection}
+                  disabled={isTestingConnection}
+                  onClick={handleTestAiConnection}
+                  icon={<Icon name="CheckCircle" size={16} />}
+                >
+                  {isTestingConnection ? "Menguji AI..." : "Tes Koneksi AI"}
+                </Button>
               </div>
+
+              {connectionError && (
+                <StatusMessage type="galat">{connectionError}</StatusMessage>
+              )}
+
+              {connectionResults && (
+                <div
+                  className="rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 flex flex-col gap-2"
+                  aria-label="Hasil Tes Koneksi AI"
+                >
+                  <p className="text-xs font-bold text-[var(--ink)]">
+                    Status Model AI Saat Ini
+                  </p>
+                  <div className="flex flex-col gap-1.5">
+                    {connectionResults.map((item) => {
+                      const label = item.ok
+                        ? "Tersedia"
+                        : item.category === "model_unavailable"
+                          ? "Tidak tersedia (404)"
+                          : item.category === "quota"
+                            ? "Kuota habis"
+                            : item.category === "invalid_key"
+                              ? "Key tidak valid"
+                              : "Sibuk (503)";
+                      return (
+                        <div
+                          key={item.model}
+                          className="flex items-center justify-between gap-2 text-xs"
+                        >
+                          <span className="font-mono font-semibold text-[var(--ink)]">
+                            {item.model}
+                          </span>
+                          <span
+                            className={
+                              item.ok
+                                ? "font-bold text-emerald-700"
+                                : "font-bold text-amber-700"
+                            }
+                          >
+                            {label} &bull; {item.latencyMs} ms
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Daftar kunci tersimpan (hanya masked + fingerprint/status) */}
               {savedKeys.length > 0 && (

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { sql } from "drizzle-orm";
+
+export const maxDuration = 60;
 import {
   generateLessonContent,
   sanitizeAndValidateLesson,

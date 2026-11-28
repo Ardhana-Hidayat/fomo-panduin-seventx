@@ -425,10 +425,25 @@ export async function generateWithGemini(
 
     return result;
   } catch (err) {
-    console.warn(
-      "All Gemini keys/models failed:",
-      err instanceof Error ? err.message : "unknown"
-    );
+    if (err instanceof AllGeminiKeysFailedError) {
+      const chainSummary =
+        err.attempts.length > 0
+          ? err.attempts
+              .map(
+                (a) =>
+                  `${a.model}:${a.ok ? "ok" : a.category ?? "err"}(${a.source})`
+              )
+              .join(" -> ")
+          : "none";
+      console.warn(
+        `All Gemini keys/models failed: lastCategory=${err.lastCategory ?? "unknown"} chain=[${chainSummary}] msg=${err.message}`
+      );
+    } else {
+      console.warn(
+        "All Gemini keys/models failed:",
+        err instanceof Error ? err.message : "unknown"
+      );
+    }
 
     if (!plan.hasSourceText) {
       throw new Error(
@@ -451,16 +466,29 @@ export async function generateWithGemini(
       durationMs: Date.now() - startedAt,
     });
 
-    const isQuotaFailure =
-      err instanceof AllGeminiKeysFailedError &&
-      (err.lastCategory === "quota" || err.quotaFingerprints.length > 0);
+    const failureCategory =
+      err instanceof AllGeminiKeysFailedError
+        ? err.lastCategory ?? (err.quotaFingerprints.length > 0 ? "quota" : "transient")
+        : "transient";
+
+    const badgeReasonByCategory: Record<string, string> = {
+      quota: "seluruh kuota API Gemini sedang penuh",
+      model_unavailable: "model AI yang dikonfigurasi tidak tersedia",
+      invalid_key: "API key Gemini tidak valid",
+      transient: "layanan AI Gemini sedang sibuk sementara",
+      timeout: "layanan AI Gemini sedang sibuk sementara",
+      blocked: "layanan AI Gemini sedang sibuk sementara",
+      bad_json: "layanan AI Gemini sedang sibuk sementara",
+    };
+
+    const badgeReason =
+      badgeReasonByCategory[failureCategory] ??
+      "layanan AI Gemini sedang sibuk sementara";
 
     return {
       lesson: validatedFallback.lesson,
       generatedBy: "fallback",
-      badge: isQuotaFailure
-        ? "Dibuat dari cadangan ekstraktif (seluruh kuota API Gemini sedang penuh)"
-        : "Dibuat dari cadangan ekstraktif (layanan AI Gemini sedang sibuk sementara)",
+      badge: `Dibuat dari cadangan ekstraktif (${badgeReason})`,
       sourceText: extractedText || options.text,
       isScannedNotice,
       visualGaps: validatedFallback.visualGaps,

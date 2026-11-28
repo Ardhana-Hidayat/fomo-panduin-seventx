@@ -7,16 +7,16 @@ import {
   maskApiKey,
 } from "../../security/crypto";
 
-export const MAX_ATTEMPTS_PER_REQUEST = 4;
+export const MAX_ATTEMPTS_PER_REQUEST = 6;
 export const TOTAL_REQUEST_BUDGET_MS = 50_000;
 export const PER_MINUTE_COOLDOWN_MS = 60_000;
 export const DAILY_QUOTA_COOLDOWN_MS = 15 * 60_000;
-export const TRANSIENT_RETRY_MIN_MS = 200;
-export const TRANSIENT_RETRY_MAX_MS = 500;
+export const TRANSIENT_BACKOFF_BASE_MS = [1_500, 4_000, 9_000] as const;
 
 export type GeminiErrorCategory =
   | "quota"
   | "invalid_key"
+  | "model_unavailable"
   | "timeout"
   | "bad_json"
   | "blocked"
@@ -235,15 +235,16 @@ export function classifyGeminiError(err: unknown): ClassifiedGeminiError {
     };
   }
 
-  // Model not found (404) -> allow fallback model
+  // Model not found / permanently unavailable (404) -> immediate fallback model, no retry/cooldown
   if (
     statusCode === 404 ||
     lower.includes("model_not_found") ||
     lower.includes("model not found") ||
-    (lower.includes("not_found") && lower.includes("model"))
+    (lower.includes("not_found") && lower.includes("model")) ||
+    lower.includes("no longer available")
   ) {
     return {
-      category: "transient",
+      category: "model_unavailable",
       isDailyQuota: false,
       modelFallbackReason: "model_not_found",
       statusCode: statusCode ?? 404,
@@ -326,11 +327,21 @@ export function resolveCandidateKeys(
   return result;
 }
 
+/**
+ * Kebijakan model terverifikasi: hanya model yang pernah menjawab 200 OK
+ * dengan key produksi yang boleh masuk rantai (`gemini-3.8-flash` -> `gemini-3.5-flash-lite`).
+ * Dilarang menambahkan model berdasarkan asumsi ketersediaan.
+ */
 function getFallbackModel(primaryModel: string): string | null {
   if (primaryModel !== "gemini-3.5-flash-lite") {
     return "gemini-3.5-flash-lite";
   }
   return null;
+}
+
+export function getModelChain(primaryModel = env.GEMINI_MODEL): string[] {
+  const fallback = getFallbackModel(primaryModel);
+  return fallback ? [primaryModel, fallback] : [primaryModel];
 }
 
 export interface KeyManagerOptions {
@@ -437,7 +448,7 @@ export class KeyManager {
       if (elapsed >= totalBudgetMs) break;
 
       let currentModel = primaryModel;
-      let transientRetriedForKey = false;
+      let transientRetriesForKey = 0;
       let modelFallbackUsedForKey = false;
 
       while (attemptCount < maxAttempts) {
@@ -509,48 +520,44 @@ export class KeyManager {
             break; // Move to next key
           }
 
-          // On 503 overloaded, retry the primary model once with jitter before falling back
-          if (
-            classified.modelFallbackReason === "overloaded" &&
-            !transientRetriedForKey
-          ) {
-            transientRetriedForKey = true;
-            if (attemptCount < maxAttempts) {
-              const jitterMs = Math.round(
-                TRANSIENT_RETRY_MIN_MS +
-                  this.random() * (TRANSIENT_RETRY_MAX_MS - TRANSIENT_RETRY_MIN_MS)
-              );
-              const left = totalBudgetMs - (this.now() - startedAt);
-              if (left > jitterMs) {
-                await this.sleep(jitterMs);
+          // Model unavailable (404) -> never retry same model, never cooldown key; switch immediately
+          if (classified.category === "model_unavailable") {
+            if (!modelFallbackUsedForKey) {
+              const fallback = getFallbackModel(currentModel);
+              if (fallback && attemptCount < maxAttempts) {
+                modelFallbackUsedForKey = true;
+                currentModel = fallback;
                 continue;
               }
             }
+            break;
           }
 
-          // Model fallback only on explicit model_not_found / overloaded
+          // Transient / overloaded (503, 5xx, timeout) -> exponential backoff (1.5s -> 4s -> 9s ±25%)
+          if (
+            (classified.category === "transient" ||
+              classified.category === "timeout") &&
+            transientRetriesForKey < TRANSIENT_BACKOFF_BASE_MS.length &&
+            attemptCount < maxAttempts
+          ) {
+            const baseDelay = TRANSIENT_BACKOFF_BASE_MS[transientRetriesForKey]!;
+            const jitterFactor = 0.75 + this.random() * 0.5;
+            const waitMs = Math.round(baseDelay * jitterFactor);
+            const left = totalBudgetMs - (this.now() - startedAt);
+            if (left > waitMs) {
+              transientRetriesForKey += 1;
+              await this.sleep(waitMs);
+              continue;
+            }
+          }
+
+          // After retries (or insufficient budget), fall back model if overloaded
           if (classified.modelFallbackReason && !modelFallbackUsedForKey) {
             const fallback = getFallbackModel(currentModel);
             if (fallback && attemptCount < maxAttempts) {
               modelFallbackUsedForKey = true;
               currentModel = fallback;
               continue;
-            }
-          }
-
-          // Transient 5xx -> retry once with jitter
-          if (classified.category === "transient" && !transientRetriedForKey) {
-            transientRetriedForKey = true;
-            if (attemptCount < maxAttempts) {
-              const jitterMs = Math.round(
-                TRANSIENT_RETRY_MIN_MS +
-                  this.random() * (TRANSIENT_RETRY_MAX_MS - TRANSIENT_RETRY_MIN_MS)
-              );
-              const left = totalBudgetMs - (this.now() - startedAt);
-              if (left > jitterMs) {
-                await this.sleep(jitterMs);
-                continue;
-              }
             }
           }
 
@@ -678,4 +685,91 @@ export async function verifyGeminiKey(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export interface GeminiModelProbeResult {
+  model: string;
+  ok: boolean;
+  category?: GeminiErrorCategory;
+  latencyMs: number;
+}
+
+/**
+ * Probes every model in the configured chain once (no retry, no backoff, 10s timeout)
+ * using the first resolved key so teachers/operators can verify AI health from Settings.
+ */
+export async function probeGeminiModels(options: {
+  teacherEncryptedKeys?: string[];
+  systemKeysOverride?: string[];
+  primaryModel?: string;
+  timeoutMs?: number;
+  now?: () => number;
+  clientFactory?: (key: string) => {
+    models: {
+      generateContent: (args: {
+        model: string;
+        contents: string;
+        config?: Record<string, unknown>;
+      }) => Promise<{ text?: string }>;
+    };
+  };
+} = {}): Promise<GeminiModelProbeResult[]> {
+  const models = getModelChain(options.primaryModel);
+  const keys = resolveCandidateKeys(
+    options.teacherEncryptedKeys,
+    options.systemKeysOverride
+  );
+  const now = options.now ?? (() => Date.now());
+  const timeoutMs = options.timeoutMs ?? 10_000;
+
+  if (keys.length === 0) {
+    return models.map((model) => ({
+      model,
+      ok: false,
+      category: "invalid_key",
+      latencyMs: 0,
+    }));
+  }
+
+  const keyEntry = keys[0]!;
+
+  return Promise.all(
+    models.map(async (model): Promise<GeminiModelProbeResult> => {
+      const startedAt = now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const ai = options.clientFactory
+          ? options.clientFactory(keyEntry.apiKey)
+          : new GoogleGenAI({ apiKey: keyEntry.apiKey });
+
+        await ai.models.generateContent({
+          model,
+          contents: "ok",
+          config: {
+            maxOutputTokens: 8,
+            temperature: 0,
+            abortSignal: controller.signal,
+          },
+        });
+
+        return {
+          model,
+          ok: true,
+          latencyMs: Math.max(0, now() - startedAt),
+        };
+      } catch (err) {
+        const classified = classifyGeminiError(err);
+        return {
+          model,
+          ok: false,
+          category: classified.category,
+          latencyMs: Math.max(0, now() - startedAt),
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    })
+  );
 }
